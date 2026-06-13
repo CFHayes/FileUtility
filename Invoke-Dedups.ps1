@@ -7,42 +7,87 @@
 
 .DESCRIPTION
     Scans a source folder and sorts files into:
-      originals\  : unique files or the first-seen copy of a duplicate
-      copies\     : confirmed duplicate files
+      - originals\  : unique files or the first-seen copy of a duplicate
+      - copies\     : confirmed duplicate files
 
-    Files are NEVER deleted. They are COPIED into the output folders.
-    Your source files are left completely untouched.
+    By default files are COPIED and your source is left untouched.
+    Use the switches below to change post-processing behaviour.
 
 .PARAMETER SourcePath
     Path to the folder containing files to deduplicate.
-    Use -Recurse to include subfolders.
 
 .PARAMETER OutputPath
     Path to the output folder. 'originals' and 'copies' subfolders
     will be created here automatically.
 
 .PARAMETER Recurse
-    If specified, scans subfolders of SourcePath as well.
+    Scan subfolders of SourcePath as well.
+
+.PARAMETER Move
+    Move files instead of copying them. The source file is removed after
+    it has been successfully transferred. Cannot be combined with -DeleteCopies.
+
+.PARAMETER DeleteCopies
+    After duplicates are copied to copies\, delete them from the source folder.
+    Originals in the source folder are left untouched.
+    Cannot be combined with -Move.
+
+.PARAMETER Compress
+    Compress one or both targets into a .zip archive after processing.
+    Valid values:
+      Source   – zip the original SourcePath folder
+      Copies   – zip the copies\ output folder
+      Both     – zip both
+
+    The .zip file is placed in OutputPath and named with a UTC timestamp,
+    e.g. source_20240615T123456Z.zip / copies_20240615T123456Z.zip
 
 .PARAMETER WhatIf
-    Dry run : reports what would happen without copying any files.
+    Dry run — reports what would happen without touching any files.
 
 .EXAMPLE
+    # Basic dedup — copy everything, touch nothing in source
     .\Invoke-Dedup.ps1 -SourcePath "C:\MyFiles" -OutputPath "C:\Sorted"
 
 .EXAMPLE
-    .\Invoke-Dedup.ps1 -SourcePath "C:\MyFiles" -OutputPath "C:\Sorted" -Recurse -WhatIf
+    # Move files out of source instead of copying
+    .\Invoke-Dedup.ps1 -SourcePath "C:\MyFiles" -OutputPath "C:\Sorted" -Move
+
+.EXAMPLE
+    # Copy, then delete duplicates from source; zip the copies\ folder
+    .\Invoke-Dedup.ps1 -SourcePath "C:\MyFiles" -OutputPath "C:\Sorted" -DeleteCopies -Compress Copies
+
+.EXAMPLE
+    # Recurse, move, compress both source and copies\, dry run first
+    .\Invoke-Dedup.ps1 -SourcePath "C:\MyFiles" -OutputPath "C:\Sorted" -Recurse -Move -Compress Both -WhatIf
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param (
     [Parameter(Mandatory)][string] $SourcePath,
     [Parameter(Mandatory)][string] $OutputPath,
-    [switch] $Recurse
+    [switch] $Recurse,
+
+    # Mutually exclusive transfer modes
+    [switch] $Move,
+    [switch] $DeleteCopies,
+
+    # Compression target
+    [ValidateSet('Source', 'Copies', 'Both')]
+    [string] $Compress
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Parameter validation
+# ---------------------------------------------------------------------------
+
+if ($Move -and $DeleteCopies) {
+    throw "Cannot use -Move and -DeleteCopies together. " +
+          "-Move transfers ALL files; -DeleteCopies only removes duplicates from source."
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,36 +108,31 @@ function Get-PartialHash {
         $fileLength = $stream.Length
 
         if ($fileLength -le ($chunkSize * 2)) {
-            # Small file — read everything
             $buf = [byte[]]::new($fileLength)
             $null = $stream.Read($buf, 0, $fileLength)
             $bytes.AddRange($buf)
         }
         else {
-            # Read first 64 KB
+            # First 64 KB
             $buf = [byte[]]::new($chunkSize)
             $null = $stream.Read($buf, 0, $chunkSize)
             $bytes.AddRange($buf)
 
-            # Read last 64 KB
+            # Last 64 KB
             $null = $stream.Seek(-$chunkSize, [System.IO.SeekOrigin]::End)
             $buf = [byte[]]::new($chunkSize)
             $null = $stream.Read($buf, 0, $chunkSize)
             $bytes.AddRange($buf)
         }
     }
-    finally {
-        $stream.Dispose()
-    }
+    finally { $stream.Dispose() }
 
     $md5 = [System.Security.Cryptography.MD5]::Create()
     try {
         $hash = $md5.ComputeHash($bytes.ToArray())
         return [System.BitConverter]::ToString($hash) -replace '-', ''
     }
-    finally {
-        $md5.Dispose()
-    }
+    finally { $md5.Dispose() }
 }
 
 function Get-FullHash {
@@ -109,17 +149,21 @@ function Get-FullHash {
     finally { $sha.Dispose() }
 }
 
-function Copy-ToOutput {
+function Move-ToOutput {
+    <#
+    Copies a file to $DestFolder (handling name collisions), then — if not a
+    WhatIf run — deletes the source file.  Returns the destination path.
+    #>
     param (
-        [string]$FilePath,
-        [string]$DestFolder
+        [string] $FilePath,
+        [string] $DestFolder,
+        [bool]   $DeleteSource   # true = Move mode or DeleteCopies for duplicate
     )
 
     $fileName  = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
     $extension = [System.IO.Path]::GetExtension($FilePath)
     $destPath  = Join-Path $DestFolder "$fileName$extension"
 
-    # Avoid filename collisions in the destination folder
     $counter = 1
     while (Test-Path $destPath) {
         $destPath = Join-Path $DestFolder "${fileName}_$counter$extension"
@@ -130,18 +174,66 @@ function Copy-ToOutput {
         Copy-Item -LiteralPath $FilePath -Destination $destPath -Force
     }
 
+    if ($DeleteSource -and $PSCmdlet.ShouldProcess($FilePath, 'Delete source file')) {
+        Remove-Item -LiteralPath $FilePath -Force
+    }
+
     return $destPath
 }
 
+function Compress-Folder {
+    <#
+    Compresses $FolderPath into a timestamped .zip in $ZipDestFolder.
+    Uses the built-in System.IO.Compression — no external tools needed.
+    #>
+    param (
+        [string] $FolderPath,
+        [string] $ZipDestFolder,
+        [string] $Label           # 'source' or 'copies'
+    )
+
+    $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $zipName   = "${Label}_${timestamp}.zip"
+    $zipPath   = Join-Path $ZipDestFolder $zipName
+
+    Write-Host "  Compressing '$FolderPath' → '$zipPath'..." -ForegroundColor Cyan
+
+    if ($PSCmdlet.ShouldProcess($zipPath, "Create zip archive of '$FolderPath'")) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $FolderPath,
+            $zipPath,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false   # don't include base directory name inside zip
+        )
+        $zipSizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+        Write-Host "  Done. Archive size: ${zipSizeMB} MB  →  $zipPath" -ForegroundColor Green
+    }
+
+    return $zipPath
+}
+
 # ---------------------------------------------------------------------------
-# Setup
+# Setup output folders
 # ---------------------------------------------------------------------------
 
 $originalsFolder = Join-Path $OutputPath 'originals'
 $copiesFolder    = Join-Path $OutputPath 'copies'
 
-if (-not (Test-Path $originalsFolder)) { New-Item -ItemType Directory -Path $originalsFolder | Out-Null }
-if (-not (Test-Path $copiesFolder))    { New-Item -ItemType Directory -Path $copiesFolder    | Out-Null }
+foreach ($folder in @($originalsFolder, $copiesFolder)) {
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder | Out-Null }
+}
+
+# Describe the run mode clearly upfront
+$modeDescription = switch ($true) {
+    ($Move)         { 'MOVE  (source files will be removed after transfer)' }
+    ($DeleteCopies) { 'COPY + DELETE DUPLICATES FROM SOURCE' }
+    default         { 'COPY  (source files untouched)' }
+}
+Write-Host "`nMode : $modeDescription" -ForegroundColor Yellow
+if ($Compress) {
+    Write-Host "Compress target : $Compress" -ForegroundColor Yellow
+}
 
 # ---------------------------------------------------------------------------
 # Step 1 — Collect files
@@ -153,7 +245,6 @@ $getChildParams = @{ LiteralPath = $SourcePath; File = $true }
 if ($Recurse) { $getChildParams['Recurse'] = $true }
 
 $allFiles = Get-ChildItem @getChildParams
-
 Write-Host "      Found $($allFiles.Count) file(s)."
 
 # ---------------------------------------------------------------------------
@@ -166,104 +257,122 @@ $groups = $allFiles | Group-Object -Property {
     "$($_.Length)|$($_.Extension.ToLower())"
 }
 
-$singletons     = $groups | Where-Object { $_.Count -eq 1 }
+$singletons      = $groups | Where-Object { $_.Count -eq 1 }
 $candidateGroups = $groups | Where-Object { $_.Count -gt 1 }
 
-$singletonCount  = ($singletons  | Measure-Object -Property Count -Sum).Sum
-$candidateCount  = ($candidateGroups | Measure-Object -Property Count -Sum).Sum
+$singletonCount = ($singletons      | Measure-Object -Property Count -Sum).Sum
+$candidateCount = ($candidateGroups | Measure-Object -Property Count -Sum).Sum
 
 Write-Host "      Singletons (unique size+ext): $singletonCount file(s) → originals/"
 Write-Host "      Candidates for hashing:       $candidateCount file(s)"
 
-# Copy singletons straight to originals
+# Singletons can never be duplicates — send straight to originals
+# In Move mode we delete the source; in Copy/DeleteCopies mode we leave it.
 foreach ($group in $singletons) {
     $file = $group.Group[0]
-    Copy-ToOutput -FilePath $file.FullName -DestFolder $originalsFolder | Out-Null
+    Move-ToOutput -FilePath $file.FullName -DestFolder $originalsFolder -DeleteSource $Move.IsPresent | Out-Null
 }
 
+$stats = @{ Originals = $singletonCount; Copies = 0; Errors = 0; Deleted = 0 }
+
 # ---------------------------------------------------------------------------
-# Step 3 & 4 — Partial hash, then full SHA256 on matches
+# Step 3 — Partial hash on candidates
 # ---------------------------------------------------------------------------
 
 Write-Host "`n[3/4] Running partial hash on candidates..." -ForegroundColor Cyan
 
-# Track confirmed duplicates: SHA256 → first-seen file path
-$seenHashes = @{}
-
-$stats = @{ Originals = $singletonCount; Copies = 0; Errors = 0 }
+$partialHashGroups = [System.Collections.Generic.Dictionary[string,
+    System.Collections.Generic.List[string]]]::new()
 
 $candidateFiles = $candidateGroups | ForEach-Object { $_.Group }
-$total          = @($candidateFiles).Count
-$index          = 0
-
-# Group candidates by partial hash first
-$partialHashGroups = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new()
+$total  = @($candidateFiles).Count
+$index  = 0
 
 foreach ($file in $candidateFiles) {
     $index++
-    Write-Progress -Activity "Partial hashing" -Status "$index / $total : $($file.Name)" `
+    Write-Progress -Activity 'Partial hashing' `
+                   -Status   "$index / $total : $($file.Name)" `
                    -PercentComplete (($index / $total) * 100)
-
     try {
         $ph = Get-PartialHash -FilePath $file.FullName
-
         if (-not $partialHashGroups.ContainsKey($ph)) {
             $partialHashGroups[$ph] = [System.Collections.Generic.List[string]]::new()
         }
         $partialHashGroups[$ph].Add($file.FullName)
     }
     catch {
-        Write-Warning "Could not hash '$($file.FullName)': $_"
+        Write-Warning "Could not partial-hash '$($file.FullName)': $_"
         $stats.Errors++
     }
 }
+Write-Progress -Activity 'Partial hashing' -Completed
 
-Write-Progress -Activity "Partial hashing" -Completed
-
-Write-Host "`n[4/4] Running full SHA256 on partial-hash matches..." -ForegroundColor Cyan
-
-$phGroups      = $partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }
-$phSingletons  = $partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -eq 1 }
-
-# Partial-hash singletons are unique — send to originals
-foreach ($entry in $phSingletons) {
-    Copy-ToOutput -FilePath $entry.Value[0] -DestFolder $originalsFolder | Out-Null
+# Partial-hash singletons are unique — no need for full hash
+foreach ($entry in ($partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -eq 1 })) {
+    Move-ToOutput -FilePath $entry.Value[0] -DestFolder $originalsFolder -DeleteSource $Move.IsPresent | Out-Null
     $stats.Originals++
 }
 
-# Full SHA256 on remaining groups
-$index = 0
-$phGroupList = @($phGroups)
-$total = ($phGroupList | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
+# ---------------------------------------------------------------------------
+# Step 4 — Full SHA256 on partial-hash matches
+# ---------------------------------------------------------------------------
+
+Write-Host "`n[4/4] Running full SHA256 on partial-hash matches..." -ForegroundColor Cyan
+
+$seenHashes  = @{}   # SHA256 → first-seen source path
+$phGroupList = @($partialHashGroups.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 })
+$total  = ($phGroupList | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
+$index  = 0
 
 foreach ($entry in $phGroupList) {
     foreach ($filePath in $entry.Value) {
         $index++
-        Write-Progress -Activity "Full SHA256" -Status "$index / $total : $(Split-Path $filePath -Leaf)" `
+        Write-Progress -Activity 'Full SHA256' `
+                       -Status   "$index / $total : $(Split-Path $filePath -Leaf)" `
                        -PercentComplete (($index / $total) * 100)
-
         try {
             $fullHash = Get-FullHash -FilePath $filePath
 
             if ($seenHashes.ContainsKey($fullHash)) {
-                # Confirmed duplicate
-                Copy-ToOutput -FilePath $filePath -DestFolder $copiesFolder | Out-Null
+                # ── DUPLICATE ──────────────────────────────────────────────
+                # Always copy to copies\ first so we have a record
+                Move-ToOutput -FilePath $filePath `
+                              -DestFolder $copiesFolder `
+                              -DeleteSource ($Move -or $DeleteCopies) | Out-Null
                 $stats.Copies++
+                if ($Move -or $DeleteCopies) { $stats.Deleted++ }
             }
             else {
+                # ── ORIGINAL (first seen) ──────────────────────────────────
                 $seenHashes[$fullHash] = $filePath
-                Copy-ToOutput -FilePath $filePath -DestFolder $originalsFolder | Out-Null
+                Move-ToOutput -FilePath $filePath `
+                              -DestFolder $originalsFolder `
+                              -DeleteSource $Move.IsPresent | Out-Null
                 $stats.Originals++
             }
         }
         catch {
-            Write-Warning "Could not hash '$filePath': $_"
+            Write-Warning "Could not full-hash '$filePath': $_"
             $stats.Errors++
         }
     }
 }
+Write-Progress -Activity 'Full SHA256' -Completed
 
-Write-Progress -Activity "Full SHA256" -Completed
+# ---------------------------------------------------------------------------
+# Compression (optional)
+# ---------------------------------------------------------------------------
+
+if ($Compress) {
+    Write-Host "`n[+] Compressing..." -ForegroundColor Cyan
+
+    if ($Compress -in @('Source', 'Both')) {
+        Compress-Folder -FolderPath $SourcePath -ZipDestFolder $OutputPath -Label 'source'
+    }
+    if ($Compress -in @('Copies', 'Both')) {
+        Compress-Folder -FolderPath $copiesFolder -ZipDestFolder $OutputPath -Label 'copies'
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -272,10 +381,20 @@ Write-Progress -Activity "Full SHA256" -Completed
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "  Deduplication Complete" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host "  Total files scanned : $($allFiles.Count)"
+Write-Host "  Mode                 : $modeDescription"
+Write-Host "  Total files scanned  : $($allFiles.Count)"
 Write-Host "  Originals            : $($stats.Originals)  →  $originalsFolder"
 Write-Host "  Copies (duplicates)  : $($stats.Copies)  →  $copiesFolder"
+if ($Move) {
+    Write-Host "  Source files removed : $($stats.Deleted)  (Move mode)"  -ForegroundColor Yellow
+}
+elseif ($DeleteCopies) {
+    Write-Host "  Duplicates deleted   : $($stats.Deleted)  from source"  -ForegroundColor Yellow
+}
+if ($Compress) {
+    Write-Host "  Compressed           : $Compress  →  $OutputPath"
+}
 if ($stats.Errors -gt 0) {
-    Write-Host "  Errors               : $($stats.Errors)" -ForegroundColor Yellow
+    Write-Host "  Errors               : $($stats.Errors)" -ForegroundColor Red
 }
 Write-Host "========================================`n" -ForegroundColor Green
